@@ -268,7 +268,233 @@ echo "提示："
 echo "  - patch 在 npx openclaw 更新后会被覆盖，需重新运行本脚本"
 echo "  - 配置文件: $OPENCLAW_CONFIG"
 
-# 4. Gateway 进程诊断
+# 4. 网络连通性诊断
+echo ""
+echo "=== 网络连通性诊断 ==="
+echo "  如果报 'network connection error' 而非 'timed out'，问题在网络层"
+echo ""
+
+# 4a. 检查代理/VPN 环境变量
+echo "  [4a] 代理/VPN 环境变量..."
+PROXY_FOUND=0
+for var in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+  val=$(printenv "$var" 2>/dev/null || true)
+  if [ -n "$val" ]; then
+    echo "    $var=$val"
+    PROXY_FOUND=1
+  fi
+done
+if [ "$PROXY_FOUND" -eq 0 ]; then
+  echo "    (未设置任何代理环境变量)"
+  echo "    如果你使用软路由/透明代理，终端进程一般不需要设置代理变量"
+  echo "    但如果 gateway 是通过 launchd 启动的，它可能无法使用软路由的代理"
+fi
+
+# 检查 NO_PROXY
+NO_PROXY_VAL=$(printenv NO_PROXY 2>/dev/null || printenv no_proxy 2>/dev/null || true)
+if [ -n "$NO_PROXY_VAL" ]; then
+  echo "    NO_PROXY=$NO_PROXY_VAL"
+  echo "    ⚠ 请确认 API 域名没有被 NO_PROXY 排除"
+fi
+echo ""
+
+# 4b. DNS 解析检查
+echo "  [4b] DNS 解析检查..."
+DNS_OK=0
+DNS_FAIL=0
+for domain in api.openai.com api.anthropic.com; do
+  # 使用多种方式尝试解析
+  resolved=""
+  if command -v nslookup &>/dev/null; then
+    resolved=$(nslookup "$domain" 2>/dev/null | grep -A1 "Name:" | grep "Address" | head -1 || true)
+  fi
+  if [ -z "$resolved" ] && command -v dig &>/dev/null; then
+    resolved=$(dig +short "$domain" 2>/dev/null | head -1 || true)
+  fi
+  if [ -z "$resolved" ] && command -v host &>/dev/null; then
+    resolved=$(host "$domain" 2>/dev/null | grep "has address" | head -1 || true)
+  fi
+  if [ -z "$resolved" ]; then
+    # 最终 fallback: getent (Linux) 或 python
+    resolved=$(getent hosts "$domain" 2>/dev/null | head -1 || true)
+  fi
+
+  if [ -n "$resolved" ]; then
+    echo "    $domain -> $resolved"
+    DNS_OK=$((DNS_OK + 1))
+  else
+    echo "    $domain -> ✗ 解析失败！"
+    DNS_FAIL=$((DNS_FAIL + 1))
+  fi
+done
+
+if [ "$DNS_FAIL" -gt 0 ]; then
+  echo ""
+  echo "    ⚠ DNS 解析失败！可能原因："
+  echo "      1. 软路由 DNS 配置问题（API 域名被污染或拦截）"
+  echo "      2. /etc/resolv.conf 中的 DNS 服务器不可用"
+  echo "      3. 防火墙/GFW 拦截了这些域名"
+  echo ""
+  echo "    排查命令："
+  echo "      cat /etc/resolv.conf"
+  echo "      nslookup api.openai.com 8.8.8.8"
+  echo "      nslookup api.openai.com 1.1.1.1"
+fi
+echo ""
+
+# 4c. TCP 连通性检查 (不发送 HTTP 请求，只检查 TCP 握手)
+echo "  [4c] TCP 连通性检查 (API endpoints)..."
+TCP_OK=0
+TCP_FAIL=0
+for endpoint in "api.openai.com:443" "api.anthropic.com:443"; do
+  host_part="${endpoint%%:*}"
+  port_part="${endpoint##*:}"
+
+  # 尝试多种方式测试 TCP 连通
+  connected=0
+  if command -v curl &>/dev/null; then
+    if curl -s --connect-timeout 10 --max-time 10 -o /dev/null "https://${host_part}" 2>/dev/null; then
+      connected=1
+    fi
+  fi
+
+  if [ "$connected" -eq 0 ] && command -v nc &>/dev/null; then
+    if nc -z -w 10 "$host_part" "$port_part" 2>/dev/null; then
+      connected=1
+    fi
+  fi
+
+  if [ "$connected" -eq 0 ]; then
+    # 使用 bash /dev/tcp 作为 fallback
+    if (echo > "/dev/tcp/${host_part}/${port_part}") 2>/dev/null; then
+      connected=1
+    fi
+  fi
+
+  if [ "$connected" -eq 1 ]; then
+    echo "    $endpoint -> ✓ 可达"
+    TCP_OK=$((TCP_OK + 1))
+  else
+    echo "    $endpoint -> ✗ 不可达 (连接失败或超时)"
+    TCP_FAIL=$((TCP_FAIL + 1))
+  fi
+done
+
+if [ "$TCP_FAIL" -gt 0 ]; then
+  echo ""
+  echo "    ⚠ API 端点 TCP 连接失败！"
+  echo "    你的终端可以连接，但 gateway 进程可能不行"
+  echo "    常见原因："
+  echo "      1. 软路由的代理规则没有覆盖这些域名"
+  echo "      2. 代理节点本身故障或负载过高"
+  echo "      3. 防火墙规则阻止了 443 端口出站连接"
+  echo ""
+  echo "    排查："
+  echo "      # 测试直连（绕过代理）"
+  echo "      curl -v --connect-timeout 10 https://api.openai.com/v1/models 2>&1 | head -30"
+  echo "      # 看 TLS 握手是否成功"
+  echo "      openssl s_client -connect api.openai.com:443 -servername api.openai.com </dev/null 2>&1 | head -20"
+fi
+echo ""
+
+# 4d. HTTP API 可达性检查 (发送无认证请求，期望 401 而非连接错误)
+echo "  [4d] HTTP API 可达性检查..."
+if command -v curl &>/dev/null; then
+  for api_url in "https://api.openai.com/v1/models" "https://api.anthropic.com/v1/messages"; do
+    domain=$(echo "$api_url" | sed 's|https://\([^/]*\).*|\1|')
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 15 --max-time 20 "$api_url" 2>/dev/null || echo "000")
+
+    if [ "$http_code" = "000" ]; then
+      echo "    $domain -> ✗ 连接失败 (网络不通)"
+    elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+      echo "    $domain -> ✓ 可达 (HTTP $http_code, 认证未通过是正常的)"
+    elif [ "$http_code" = "200" ]; then
+      echo "    $domain -> ✓ 可达 (HTTP 200)"
+    else
+      echo "    $domain -> △ HTTP $http_code (连接成功但响应异常)"
+    fi
+  done
+else
+  echo "    curl 不可用，跳过 HTTP 检查"
+fi
+echo ""
+
+# 4e. 检查 gateway 进程是否能继承网络环境
+echo "  [4e] Gateway 进程网络环境检查..."
+GW_PID_NET=$(pgrep -f 'openclaw.*gateway' 2>/dev/null | head -1 || true)
+if [ -n "$GW_PID_NET" ]; then
+  echo "    Gateway PID: $GW_PID_NET"
+  # Linux: 读取 /proc/PID/environ
+  if [ -f "/proc/$GW_PID_NET/environ" ]; then
+    GW_PROXY=$(tr '\0' '\n' < "/proc/$GW_PID_NET/environ" 2>/dev/null | grep -iE "proxy|all_proxy" || true)
+    if [ -n "$GW_PROXY" ]; then
+      echo "    Gateway 进程代理变量:"
+      echo "$GW_PROXY" | while read -r line; do echo "      $line"; done
+    else
+      echo "    Gateway 进程没有代理环境变量"
+      echo "    如果你依赖代理翻墙，gateway 可能无法访问 API"
+    fi
+    # 检查 NODE_TLS_REJECT_UNAUTHORIZED
+    GW_TLS=$(tr '\0' '\n' < "/proc/$GW_PID_NET/environ" 2>/dev/null | grep "NODE_TLS" || true)
+    if [ -n "$GW_TLS" ]; then
+      echo "    TLS 设置: $GW_TLS"
+    fi
+  fi
+  # macOS: 无法直接读取进程环境变量，给出提示
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "    macOS 无法直接读取进程环境变量"
+    echo "    如果 gateway 通过 launchd 启动，代理变量可能未继承"
+    echo "    建议手动启动: pkill -f openclaw && npx openclaw gateway"
+  fi
+else
+  echo "    Gateway 进程未运行，无法检查其网络环境"
+fi
+echo ""
+
+# 4f. 综合诊断建议
+echo "  [4f] 综合诊断建议..."
+if [ "$TCP_FAIL" -gt 0 ] || [ "$DNS_FAIL" -gt 0 ]; then
+  echo ""
+  echo "  ===== 网络问题确认 ====="
+  echo ""
+  echo "  你的环境存在网络连通性问题。可能的修复方案："
+  echo ""
+  echo "  方案 1: 确保软路由代理规则覆盖 API 域名"
+  echo "    在软路由(OpenWrt/Clash/V2Ray)的代理规则中添加："
+  echo "      - api.openai.com"
+  echo "      - api.anthropic.com"
+  echo "    确保这些域名走代理而非直连"
+  echo ""
+  echo "  方案 2: 给 gateway 进程设置代理环境变量"
+  echo "    export HTTPS_PROXY=http://你的代理地址:端口"
+  echo "    export HTTP_PROXY=http://你的代理地址:端口"
+  echo "    npx openclaw gateway"
+  echo ""
+  echo "  方案 3: 如果用 launchd 管理 gateway，在 plist 中添加环境变量"
+  echo "    找到 plist: find ~/Library/LaunchAgents -name '*openclaw*'"
+  echo "    在 <dict> 中添加:"
+  echo "    <key>EnvironmentVariables</key>"
+  echo "    <dict>"
+  echo "      <key>HTTPS_PROXY</key>"
+  echo "      <string>http://你的代理地址:端口</string>"
+  echo "    </dict>"
+  echo ""
+else
+  echo "    ✓ 从当前终端可以连通 API 端点"
+  echo "    如果 gateway 仍报 'network connection error'，问题可能是："
+  echo "      1. Gateway 进程的网络环境与终端不同"
+  echo "         -> 手动前台启动: pkill -f openclaw && npx openclaw gateway"
+  echo "      2. API Key 未配置或已失效"
+  echo "         -> 检查 ~/.openclaw/openclaw.json 中的 apiKey"
+  echo "      3. TLS/SSL 证书问题（代理使用了 MITM 证书）"
+  echo "         -> export NODE_TLS_REJECT_UNAUTHORIZED=0 （临时测试用）"
+  echo "         -> 或将代理 CA 证书添加到系统信任链"
+  echo "      4. Node.js 版本过低不支持某些 TLS 特性"
+  echo "         -> node --version (建议 >= 18)"
+  echo ""
+fi
+
+# 5. Gateway 进程诊断
 echo ""
 echo "=== Gateway 进程诊断 ==="
 
