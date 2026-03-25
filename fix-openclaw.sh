@@ -45,33 +45,59 @@ else
   exit 1
 fi
 
-# 4. Patch GatewayClient 硬编码超时 (根因修复)
-echo "[4/6] Patch GatewayClient 硬编码超时..."
-# 找到 openclaw 安装路径中的 method-scopes 文件
-# GatewayClient 构造函数中 requestTimeoutMs 默认值为 3e4 (30秒)
-# 这个值控制所有通过 Gateway WebSocket 发出的请求超时，包括 LLM 调用
-# 配置文件无法覆盖此值，必须直接 patch 源码
-OPENCLAW_PKG_DIR=$(find "$HOME/.npm/_npx" /tmp -maxdepth 6 -path "*/openclaw/dist/method-scopes-*.js" 2>/dev/null | head -1)
-if [ -n "$OPENCLAW_PKG_DIR" ]; then
-  # 将默认 requestTimeoutMs 从 30s (3e4) 改为 300s (3e5)
-  if grep -q 'requestTimeoutMs.*: 3e4' "$OPENCLAW_PKG_DIR"; then
-    sed -i 's/requestTimeoutMs.*: 3e4/requestTimeoutMs, 2147483647)) : 3e5/' "$OPENCLAW_PKG_DIR" 2>/dev/null || true
-    # 验证 patch 是否成功
-    if grep -q '3e5' "$OPENCLAW_PKG_DIR"; then
-      echo "  ✓ 已 patch requestTimeoutMs: 30s -> 300s"
-    else
-      echo "  ⚠ patch 可能未成功，尝试备用方案..."
-      sed -i 's/: 3e4;/: 3e5;/g' "$OPENCLAW_PKG_DIR"
-      echo "  ✓ 已用备用方案 patch"
+# 4. Patch 所有硬编码超时 (根因修复)
+echo "[4/6] Patch 硬编码超时值..."
+# OpenClaw 有 3 处硬编码的 30s 超时导致 LLM 请求超时：
+#   a) method-scopes-*.js: GatewayClient.requestTimeoutMs = 3e4 (WebSocket 请求超时)
+#   b) pi-embedded-*.js: resolveGatewayOptions 中 callGatewayTool 的默认 timeoutMs = 3e4
+#   c) call-*.js: resolveGatewayCallTimeout 连接超时 = 1e4 (10秒)
+# 配置文件无法覆盖这些值，必须直接 patch 源码
+OPENCLAW_DIST=$(find "$HOME/.npm/_npx" /tmp -maxdepth 6 -path "*/openclaw/dist" -type d 2>/dev/null | head -1)
+PATCH_COUNT=0
+if [ -n "$OPENCLAW_DIST" ]; then
+  # Patch a) GatewayClient.requestTimeoutMs: 30s -> 300s
+  METHOD_SCOPES=$(ls "$OPENCLAW_DIST"/method-scopes-*.js 2>/dev/null | head -1)
+  if [ -n "$METHOD_SCOPES" ]; then
+    if grep -q 'requestTimeoutMs.*: 3e4' "$METHOD_SCOPES"; then
+      sed -i 's/\(requestTimeoutMs.*\): 3e4/\1: 3e5/g' "$METHOD_SCOPES"
+      echo "  ✓ [a] GatewayClient.requestTimeoutMs: 30s -> 300s"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
+    elif grep -q 'requestTimeoutMs.*: 3e5' "$METHOD_SCOPES"; then
+      echo "  ✓ [a] 已 patch (300s)"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
     fi
-  elif grep -q '3e5' "$OPENCLAW_PKG_DIR"; then
-    echo "  ✓ 已经是 patch 后的值 (300s)"
-  else
-    echo "  ⚠ 未找到预期的超时值，可能版本不同"
   fi
+
+  # Patch b) callGatewayTool 默认 timeoutMs: 30s -> 300s
+  PI_EMBEDDED=$(ls "$OPENCLAW_DIST"/pi-embedded-*.js 2>/dev/null | head -1)
+  if [ -n "$PI_EMBEDDED" ]; then
+    if grep -q 'opts\.timeoutMs)) : 3e4' "$PI_EMBEDDED"; then
+      sed -i 's/opts\.timeoutMs)) : 3e4/opts.timeoutMs)) : 3e5/g' "$PI_EMBEDDED"
+      echo "  ✓ [b] callGatewayTool timeoutMs: 30s -> 300s"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
+    elif grep -q 'opts\.timeoutMs)) : 3e5' "$PI_EMBEDDED"; then
+      echo "  ✓ [b] 已 patch (300s)"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
+    fi
+  fi
+
+  # Patch c) resolveGatewayCallTimeout 连接超时: 10s -> 300s
+  CALL_FILE=$(ls "$OPENCLAW_DIST"/call-*.js 2>/dev/null | head -1)
+  if [ -n "$CALL_FILE" ]; then
+    if grep -q 'timeoutValue) : 1e4' "$CALL_FILE"; then
+      sed -i 's/timeoutValue) : 1e4/timeoutValue) : 3e5/g' "$CALL_FILE"
+      echo "  ✓ [c] resolveGatewayCallTimeout: 10s -> 300s"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
+    elif grep -q 'timeoutValue) : 3e5' "$CALL_FILE"; then
+      echo "  ✓ [c] 已 patch (300s)"
+      PATCH_COUNT=$((PATCH_COUNT + 1))
+    fi
+  fi
+
+  echo "  Patch 完成: $PATCH_COUNT/3 处已修复"
 else
   echo "  ⚠ 未找到 openclaw 安装路径，跳过 patch"
-  echo "    请手动运行: npx openclaw --version 确认已安装"
+  echo "    请先运行: npx openclaw --version 确认已安装"
 fi
 
 # 5. 写入超时配置文件 (补充保护)
@@ -158,10 +184,13 @@ CFGEOF
 fi
 
 echo "  配置详情:"
-echo "    - GatewayClient requestTimeoutMs: 300s (原 30s，已 patch)"
 echo "    - Agent 超时: 300s"
 echo "    - Provider requestTimeout: 300s"
 echo "    - 失败重试: 最多 5 次，指数退避 1s-60s"
+echo "  Patch 详情:"
+echo "    - GatewayClient.requestTimeoutMs: 30s -> 300s"
+echo "    - callGatewayTool timeoutMs: 30s -> 300s"
+echo "    - resolveGatewayCallTimeout: 10s -> 300s"
 
 # 6. 检查 OpenClaw Gateway
 echo "[6/6] 检查 OpenClaw Gateway..."
