@@ -25,31 +25,23 @@ safe_replace() {
 echo ""
 echo "[1/3] 查找 OpenClaw 安装路径..."
 OPENCLAW_DIST=""
-for search_dir in "$HOME/.npm/_npx" "$HOME/Library/pnpm" "$HOME/.pnpm" /tmp; do
-  found=$(find "$search_dir" -maxdepth 8 -path "*/openclaw/dist" -type d 2>/dev/null | head -1)
-  if [ -n "$found" ]; then
-    OPENCLAW_DIST="$found"
+# 先直接检查已知路径（最快）
+for direct_path in /opt/homebrew/lib/node_modules/openclaw/dist /usr/local/lib/node_modules/openclaw/dist; do
+  if [ -d "$direct_path" ]; then
+    OPENCLAW_DIST="$direct_path"
     break
   fi
 done
 
-# 也搜索全局 node_modules
+# 再搜索 npx 缓存和全局 node_modules
 if [ -z "$OPENCLAW_DIST" ]; then
-  # 直接检查已知路径（避免 find 深度不足的问题）
-  for direct_path in /opt/homebrew/lib/node_modules/openclaw/dist /usr/local/lib/node_modules/openclaw/dist; do
-    if [ -d "$direct_path" ]; then
-      OPENCLAW_DIST="$direct_path"
-      break
-    fi
-  done
-fi
-
-if [ -z "$OPENCLAW_DIST" ]; then
-  for search_dir in /usr/local/lib/node_modules /opt/homebrew/lib/node_modules "$HOME/.local/share"; do
-    found=$(find "$search_dir" -maxdepth 8 -path "*/openclaw/dist" -type d 2>/dev/null | head -1)
-    if [ -n "$found" ]; then
-      OPENCLAW_DIST="$found"
-      break
+  for search_dir in "$HOME/.npm/_npx" "$HOME/Library/pnpm" "$HOME/.pnpm" /tmp /usr/local/lib/node_modules /opt/homebrew/lib/node_modules "$HOME/.local/share"; do
+    if [ -d "$search_dir" ]; then
+      found=$(find "$search_dir" -maxdepth 8 -path "*/openclaw/dist" -type d 2>/dev/null | head -1 || true)
+      if [ -n "$found" ]; then
+        OPENCLAW_DIST="$found"
+        break
+      fi
     fi
   done
 fi
