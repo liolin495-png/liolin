@@ -35,8 +35,18 @@ done
 
 # 也搜索全局 node_modules
 if [ -z "$OPENCLAW_DIST" ]; then
+  # 直接检查已知路径（避免 find 深度不足的问题）
+  for direct_path in /opt/homebrew/lib/node_modules/openclaw/dist /usr/local/lib/node_modules/openclaw/dist; do
+    if [ -d "$direct_path" ]; then
+      OPENCLAW_DIST="$direct_path"
+      break
+    fi
+  done
+fi
+
+if [ -z "$OPENCLAW_DIST" ]; then
   for search_dir in /usr/local/lib/node_modules /opt/homebrew/lib/node_modules "$HOME/.local/share"; do
-    found=$(find "$search_dir" -maxdepth 6 -path "*/openclaw/dist" -type d 2>/dev/null | head -1)
+    found=$(find "$search_dir" -maxdepth 8 -path "*/openclaw/dist" -type d 2>/dev/null | head -1)
     if [ -n "$found" ]; then
       OPENCLAW_DIST="$found"
       break
