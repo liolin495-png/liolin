@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenClaw LLM 超时修复脚本 (macOS / Linux 通用)
 # 问题：所有 provider (OpenAI / Anthropic / VibeCoding) 都报 "LLM request timed out"
-# 根因：OpenClaw 源码中有 3 处硬编码超时值太短，配置文件无法覆盖
+# 根因：OpenClaw 源码中有 4 处硬编码超时值太短，配置文件无法覆盖
 #
 # 用法：bash fix-openclaw.sh
 # 修复后必须重启 Gateway：pkill -f 'openclaw' && npx openclaw gateway
@@ -55,14 +55,15 @@ echo "  ✓ 找到: $OPENCLAW_DIST"
 # 2. Patch 所有硬编码超时
 echo ""
 echo "[2/3] Patch 硬编码超时值..."
-echo "  OpenClaw 有 3 处硬编码超时导致 LLM 请求超时："
+echo "  OpenClaw 有 4 处硬编码超时导致 LLM 请求超时："
 echo "    a) GatewayClient.requestTimeoutMs = 30s (WebSocket 请求)"
 echo "    b) callGatewayTool timeoutMs = 30s (工具调用)"
 echo "    c) resolveGatewayCallTimeout = 10s (连接超时)"
+echo "    d) gateway-rpc CLI default + fallback = 30s/10s (RPC 调用)"
 echo ""
 
 PATCH_COUNT=0
-PATCH_TOTAL=3
+PATCH_TOTAL=4
 
 # Patch a) GatewayClient.requestTimeoutMs: 30s -> 300s
 METHOD_SCOPES=$(ls "$OPENCLAW_DIST"/method-scopes-*.js 2>/dev/null | head -1)
@@ -127,6 +128,37 @@ if [ -n "$CALL_FILE" ]; then
   fi
 else
   echo "  ⚠ [c] 未找到 call-*.js"
+fi
+
+# Patch d) gateway-rpc CLI default 30s -> 300s 和 fallback 10s -> 300s
+GW_RPC=$(ls "$OPENCLAW_DIST"/gateway-rpc-*.js 2>/dev/null | head -1)
+if [ -n "$GW_RPC" ]; then
+  D_PATCHED=0
+  # CLI 默认值 "30000" -> "300000"
+  if grep -q '"30000"' "$GW_RPC" 2>/dev/null; then
+    safe_replace "$GW_RPC" '"30000"' '"300000"'
+    D_PATCHED=1
+  elif grep -q '"300000"' "$GW_RPC" 2>/dev/null; then
+    D_PATCHED=1
+  fi
+  # fallback 1e4 -> 3e5
+  if grep -q '?? 1e4' "$GW_RPC" 2>/dev/null; then
+    safe_replace "$GW_RPC" '?? 1e4' '?? 3e5'
+    D_PATCHED=$((D_PATCHED + 1))
+  elif grep -q '?? 3e5' "$GW_RPC" 2>/dev/null; then
+    D_PATCHED=$((D_PATCHED + 1))
+  fi
+  if [ "$D_PATCHED" -ge 2 ]; then
+    echo "  ✓ [d] gateway-rpc: CLI 30s + fallback 10s -> 300s"
+    PATCH_COUNT=$((PATCH_COUNT + 1))
+  elif [ "$D_PATCHED" -ge 1 ]; then
+    echo "  △ [d] gateway-rpc: 部分 patch 成功"
+    PATCH_COUNT=$((PATCH_COUNT + 1))
+  else
+    echo "  ⚠ [d] 未找到预期的超时值"
+  fi
+else
+  echo "  ⚠ [d] 未找到 gateway-rpc-*.js"
 fi
 
 echo ""
@@ -227,6 +259,7 @@ echo "  # 验证 patch 是否生效"
 echo "  grep -o 'requestTimeoutMs.*: [0-9e]*' $OPENCLAW_DIST/method-scopes-*.js"
 echo "  grep -o 'timeoutMs)) : [0-9e]*' $OPENCLAW_DIST/pi-embedded-*.js | head -1"
 echo "  grep -o 'timeoutValue) : [0-9e]*' $OPENCLAW_DIST/call-*.js"
+echo "  grep -n 'timeout\|1e4\|3e4\|3e5\|30000\|300000' $OPENCLAW_DIST/gateway-rpc-*.js"
 echo ""
 echo "  # 查看 gateway 日志"
 echo "  npx openclaw gateway logs"
@@ -234,3 +267,56 @@ echo ""
 echo "提示："
 echo "  - patch 在 npx openclaw 更新后会被覆盖，需重新运行本脚本"
 echo "  - 配置文件: $OPENCLAW_CONFIG"
+
+# 4. Gateway 进程诊断
+echo ""
+echo "=== Gateway 进程诊断 ==="
+
+# 检查 launchctl
+if command -v launchctl &>/dev/null; then
+  GW_STATUS=$(launchctl list 2>/dev/null | grep -i gateway || true)
+  if [ -n "$GW_STATUS" ]; then
+    EXIT_CODE=$(echo "$GW_STATUS" | awk '{print $2}')
+    echo "  launchctl 状态: $GW_STATUS"
+    if [ "$EXIT_CODE" = "-9" ]; then
+      echo ""
+      echo "  ⚠⚠⚠ Gateway 退出码 -9 (SIGKILL) ⚠⚠⚠"
+      echo "  这意味着 Gateway 进程被系统强制杀掉了！"
+      echo "  常见原因："
+      echo "    1. 内存不足 (OOM) — macOS 杀掉了高内存进程"
+      echo "    2. launchd 启动超时 — 进程启动太慢被 launchd 杀掉"
+      echo "    3. 沙盒/权限问题"
+      echo ""
+      echo "  建议排查步骤："
+      echo "    # 查看系统日志中的 kill 原因"
+      echo "    log show --predicate 'process == \"openclaw\" OR eventMessage CONTAINS \"openclaw\"' --last 5m"
+      echo ""
+      echo "    # 查看是否 OOM"
+      echo "    log show --predicate 'eventMessage CONTAINS \"Jetsam\"' --last 10m | head -20"
+      echo ""
+      echo "    # 手动前台启动 gateway 观察报错"
+      echo "    launchctl stop ai.openclaw.gateway 2>/dev/null"
+      echo "    npx openclaw gateway"
+      echo ""
+      echo "    # 如果是 launchd 超时，可增加 plist 中的 TimeoutStartInterval"
+      echo "    # 找到 plist 文件："
+      echo "    find ~/Library/LaunchAgents /Library/LaunchAgents -name '*openclaw*' 2>/dev/null"
+    elif [ "$EXIT_CODE" != "0" ] && [ "$EXIT_CODE" != "-" ]; then
+      echo "  ⚠ Gateway 退出码: $EXIT_CODE (非正常)"
+      echo "  建议手动前台启动查看报错: npx openclaw gateway"
+    else
+      echo "  ✓ Gateway 状态正常"
+    fi
+  else
+    echo "  Gateway 未在 launchctl 中注册"
+  fi
+fi
+
+# 检查进程
+GW_PID=$(pgrep -f 'openclaw.*gateway' 2>/dev/null || true)
+if [ -n "$GW_PID" ]; then
+  echo "  ✓ Gateway 进程运行中: PID $GW_PID"
+else
+  echo "  ✗ Gateway 进程未运行"
+  echo "    尝试手动启动: npx openclaw gateway"
+fi
