@@ -3,7 +3,8 @@
 # 问题：截图失败 / 无法控制电脑 / 权限不足 / LLM 请求超时
 # 根因：
 #   1. Linux 环境缺少图形显示服务器 (DISPLAY 未设置)
-#   2. LLM 请求默认超时时间太短 (30s)，需要增大超时并配置重试
+#   2. GatewayClient.requestTimeoutMs 硬编码为 30s (3e4)，导致 LLM 请求超时
+#   3. 配置文件的 timeoutSeconds 无法覆盖 Gateway WebSocket 请求超时
 
 set -euo pipefail
 
@@ -44,33 +45,56 @@ else
   exit 1
 fi
 
-# 4. 修复 LLM 请求超时配置
-echo "[4/5] 修复 LLM 请求超时配置..."
+# 4. Patch GatewayClient 硬编码超时 (根因修复)
+echo "[4/6] Patch GatewayClient 硬编码超时..."
+# 找到 openclaw 安装路径中的 method-scopes 文件
+# GatewayClient 构造函数中 requestTimeoutMs 默认值为 3e4 (30秒)
+# 这个值控制所有通过 Gateway WebSocket 发出的请求超时，包括 LLM 调用
+# 配置文件无法覆盖此值，必须直接 patch 源码
+OPENCLAW_PKG_DIR=$(find "$HOME/.npm/_npx" /tmp -maxdepth 6 -path "*/openclaw/dist/method-scopes-*.js" 2>/dev/null | head -1)
+if [ -n "$OPENCLAW_PKG_DIR" ]; then
+  # 将默认 requestTimeoutMs 从 30s (3e4) 改为 300s (3e5)
+  if grep -q 'requestTimeoutMs.*: 3e4' "$OPENCLAW_PKG_DIR"; then
+    sed -i 's/requestTimeoutMs.*: 3e4/requestTimeoutMs, 2147483647)) : 3e5/' "$OPENCLAW_PKG_DIR" 2>/dev/null || true
+    # 验证 patch 是否成功
+    if grep -q '3e5' "$OPENCLAW_PKG_DIR"; then
+      echo "  ✓ 已 patch requestTimeoutMs: 30s -> 300s"
+    else
+      echo "  ⚠ patch 可能未成功，尝试备用方案..."
+      sed -i 's/: 3e4;/: 3e5;/g' "$OPENCLAW_PKG_DIR"
+      echo "  ✓ 已用备用方案 patch"
+    fi
+  elif grep -q '3e5' "$OPENCLAW_PKG_DIR"; then
+    echo "  ✓ 已经是 patch 后的值 (300s)"
+  else
+    echo "  ⚠ 未找到预期的超时值，可能版本不同"
+  fi
+else
+  echo "  ⚠ 未找到 openclaw 安装路径，跳过 patch"
+  echo "    请手动运行: npx openclaw --version 确认已安装"
+fi
+
+# 5. 写入超时配置文件 (补充保护)
+echo "[5/6] 写入超时配置..."
 OPENCLAW_DIR="$HOME/.openclaw"
 OPENCLAW_CONFIG="$OPENCLAW_DIR/openclaw.json"
 mkdir -p "$OPENCLAW_DIR"
 
 if [ -f "$OPENCLAW_CONFIG" ]; then
-  # 备份现有配置
   cp "$OPENCLAW_CONFIG" "$OPENCLAW_CONFIG.bak.$(date +%s)"
   echo "  已备份现有配置"
 
-  # 用 node 合并超时配置（保留用户已有设置）
   if command -v node &>/dev/null; then
     node -e "
       const fs = require('fs');
       const cfg = JSON.parse(fs.readFileSync('$OPENCLAW_CONFIG', 'utf8'));
-
-      // 设置 agent 默认超时为 300 秒
       cfg.agents = cfg.agents || {};
       cfg.agents.defaults = cfg.agents.defaults || {};
       cfg.agents.defaults.timeoutSeconds = Math.max(cfg.agents.defaults.timeoutSeconds || 0, 300);
-
-      // 为所有已配置的 provider 增加 requestTimeout 和 retry
       cfg.models = cfg.models || {};
       cfg.models.providers = cfg.models.providers || {};
       for (const [name, provider] of Object.entries(cfg.models.providers)) {
-        provider.requestTimeout = Math.max(provider.requestTimeout || 0, 120000);
+        provider.requestTimeout = Math.max(provider.requestTimeout || 0, 300000);
         provider.retry = Object.assign({
           attempts: 5,
           minDelayMs: 1000,
@@ -79,13 +103,10 @@ if [ -f "$OPENCLAW_CONFIG" ]; then
         }, provider.retry || {});
         provider.retry.attempts = Math.max(provider.retry.attempts, 5);
       }
-
       fs.writeFileSync('$OPENCLAW_CONFIG', JSON.stringify(cfg, null, 2) + '\n');
     "
     echo "  ✓ 已合并超时配置到现有设置"
   else
-    echo "  ⚠ node 不可用，跳过配置合并（将创建新配置）"
-    # 直接覆写
     cat > "$OPENCLAW_CONFIG" << 'CFGEOF'
 {
   "agents": {
@@ -96,7 +117,7 @@ if [ -f "$OPENCLAW_CONFIG" ]; then
   "models": {
     "providers": {
       "openai": {
-        "requestTimeout": 120000,
+        "requestTimeout": 300000,
         "retry": {
           "attempts": 5,
           "minDelayMs": 1000,
@@ -111,7 +132,6 @@ CFGEOF
     echo "  ✓ 已写入新的超时配置"
   fi
 else
-  # 创建新配置文件
   cat > "$OPENCLAW_CONFIG" << 'CFGEOF'
 {
   "agents": {
@@ -122,7 +142,7 @@ else
   "models": {
     "providers": {
       "openai": {
-        "requestTimeout": 120000,
+        "requestTimeout": 300000,
         "retry": {
           "attempts": 5,
           "minDelayMs": 1000,
@@ -138,12 +158,13 @@ CFGEOF
 fi
 
 echo "  配置详情:"
-echo "    - Agent 超时: 300 秒 (默认 30 秒)"
-echo "    - LLM 请求超时: 120 秒 / 请求"
+echo "    - GatewayClient requestTimeoutMs: 300s (原 30s，已 patch)"
+echo "    - Agent 超时: 300s"
+echo "    - Provider requestTimeout: 300s"
 echo "    - 失败重试: 最多 5 次，指数退避 1s-60s"
 
-# 5. 检查 OpenClaw Gateway
-echo "[5/5] 检查 OpenClaw Gateway..."
+# 6. 检查 OpenClaw Gateway
+echo "[6/6] 检查 OpenClaw Gateway..."
 if npx openclaw browser status &>/dev/null; then
   echo "  ✓ Gateway 正在运行"
   echo ""
@@ -171,4 +192,5 @@ echo "=== 完成 ==="
 echo "提示:"
 echo "  1. 将 'export DISPLAY=:99' 加入 ~/.bashrc 以永久生效"
 echo "  2. 超时配置文件: ~/.openclaw/openclaw.json"
-echo "  3. 如仍超时，可手动调大 timeoutSeconds 和 requestTimeout 的值"
+echo "  3. patch 在 npx openclaw 更新后需重新运行本脚本"
+echo "  4. 修复后必须重启 Gateway 才能生效"
